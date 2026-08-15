@@ -1,5 +1,6 @@
 from time import sleep
 
+from calibration_config import load_center_offset_px
 from camera import AlignmentCamera
 from distance_sensor import UltrasonicDistance
 from display import ParkingDisplay
@@ -10,30 +11,14 @@ CENTER_TOLERANCE_PX = 40
 LOOP_DELAY_S = 0.02  # small yield only; detection itself (~0.2-0.3s) sets the real pace
 
 # YOLO inference size in px; lower = faster but less accurate on small/far
-# objects. Combined with ROI_RIGHT_FRAC below (which crops the wide 16:9
-# frame toward square before this resize), 288 lands well ahead of the old
-# full-frame 640 default on both speed and accuracy.
+# objects. The calibrated ROI crop narrows the wide 16:9 frame before resize.
 DETECTION_IMGSZ = 288
-
-# Only the left ROI_RIGHT_FRAC fraction of the frame (from the left edge) is
-# captured/analyzed -- the rest of the garage (e.g. the neighboring car's
-# spot) is cropped away before detection ever sees it. Tune by running
-# `python3 camera.py`, which saves roi_snapshot.jpg so you can check the crop
-# line lands where the left spot ends.
-ROI_RIGHT_FRAC = 0.55
-
-# Calibration offset (px, ROI-frame units) so "centered in the spot" reads
-# as 0 even if the camera itself is mounted off-axis. Run `python3 camera.py`
-# with the car parked exactly where it should be and set this to the offset
-# it reports.
-CENTER_OFFSET_PX = 0
-
 
 def main():
     print("Starting Smart Garage Parking Assistant...")
 
-    cam = AlignmentCamera(imgsz=DETECTION_IMGSZ, center_offset_px=CENTER_OFFSET_PX,
-                           roi_right_frac=ROI_RIGHT_FRAC)
+    cam = AlignmentCamera(imgsz=DETECTION_IMGSZ,
+                           center_offset_px=load_center_offset_px())
     ultrasonic = UltrasonicDistance()
     display = ParkingDisplay(stop_distance_cm=STOP_DISTANCE_CM)
     fusion = ParkingFusion(
