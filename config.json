@@ -1,4 +1,5 @@
 {
-  "center_offset_px": 132,
-  "roi_right_frac": 0.8064314586230876
+  "center_offset_px": 5,
+  "roi_right_frac": 0.8064314586230876,
+  "roi_left_frac": 0.19128400990959665
 }

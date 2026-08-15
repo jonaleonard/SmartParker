@@ -3,7 +3,7 @@ import numpy as np
 import onnxruntime as ort
 from collections import deque
 
-from calibration_config import load_roi_right_frac
+from calibration_config import load_roi_left_frac, load_roi_right_frac
 
 
 class AlignmentCamera:
@@ -19,7 +19,8 @@ class AlignmentCamera:
     RELEASE_AFTER_MISSES = 8
 
     def __init__(self, camera_index=0, width=1280, height=720, confidence=0.2,
-                 imgsz=480, center_offset_px=0, roi_right_frac=1.0):
+                 imgsz=480, center_offset_px=0, roi_right_frac=None,
+                 roi_left_frac=None):
         """
         imgsz: retained for compatibility with existing callers. The exported
             ONNX model's input shape is used for inference (normally 640x640).
@@ -37,6 +38,9 @@ class AlignmentCamera:
             of the other side's car being picked up, and as a side effect
             shrinks a wide 16:9 frame toward square, which YOLO's letterbox
             resize handles far more accurately than a very wide frame.
+        roi_left_frac: fraction [0-1) of the frame's width, measured from the
+            left edge. Everything to the left of this line is cropped away.
+            Together with roi_right_frac, it defines the watched region.
         """
         self.cap = cv2.VideoCapture(camera_index)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -47,7 +51,10 @@ class AlignmentCamera:
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         self.last_full_frame = None
-        self.set_roi_right_frac(load_roi_right_frac() if roi_right_frac is None else roi_right_frac)
+        self.set_roi_bounds(
+            load_roi_left_frac() if roi_left_frac is None else roi_left_frac,
+            load_roi_right_frac() if roi_right_frac is None else roi_right_frac,
+        )
 
         self.model = ort.InferenceSession(
             "yolov8n.onnx", providers=["CPUExecutionProvider"]
@@ -91,12 +98,32 @@ class AlignmentCamera:
         return (*self._last_valid_detection, True)
 
     def set_roi_right_frac(self, roi_right_frac):
-        """Set the right crop boundary as a fraction of the captured frame."""
-        value = float(roi_right_frac)
-        if not 0 < value <= 1:
+        """Set the right crop boundary, preserving the current left boundary."""
+        self.set_roi_bounds(getattr(self, "roi_left_frac", 0.0), roi_right_frac)
+
+    def set_roi_left_frac(self, roi_left_frac):
+        """Set the left crop boundary, preserving the current right boundary."""
+        self.set_roi_bounds(roi_left_frac, getattr(self, "roi_right_frac", 1.0))
+
+    def set_roi_bounds(self, roi_left_frac, roi_right_frac):
+        """Set both ROI boundaries as fractions of the captured frame."""
+        left_value = float(roi_left_frac)
+        right_value = float(roi_right_frac)
+        if not 0 <= left_value < 1:
+            raise ValueError("roi_left_frac must be at least 0 and less than 1")
+        if not 0 < right_value <= 1:
             raise ValueError("roi_right_frac must be greater than 0 and at most 1")
-        self.roi_right_frac = value
-        self.frame_width = max(1, int(self.capture_width * value))
+
+        left_px = int(self.capture_width * left_value)
+        right_px = int(self.capture_width * right_value)
+        if left_px >= right_px:
+            raise ValueError("ROI left boundary must be to the left of the right boundary")
+
+        self.roi_left_frac = left_value
+        self.roi_right_frac = right_value
+        self.roi_left_px = left_px
+        self.roi_right_px = right_px
+        self.frame_width = right_px - left_px
 
     @staticmethod
     def _static_dimension(value, fallback):
@@ -203,7 +230,7 @@ class AlignmentCamera:
         if not ret:
             return ret, frame
         self.last_full_frame = frame
-        return ret, frame[:, :self.frame_width]
+        return ret, frame[:, self.roi_left_px:self.roi_right_px]
 
     def detect(self, frame):
         """
@@ -265,8 +292,9 @@ class AlignmentCamera:
 
 if __name__ == "__main__":
     print("Starting alignment test, Ctrl+C to stop...")
-    cam = AlignmentCamera(roi_right_frac=None, confidence=0.2, imgsz=480)
-    print(f"Watching {cam.frame_width}x{cam.frame_height} (roi_right_frac={cam.roi_right_frac}), imgsz={cam.imgsz}")
+    cam = AlignmentCamera(roi_right_frac=None, roi_left_frac=None, confidence=0.2, imgsz=480)
+    print(f"Watching {cam.frame_width}x{cam.frame_height} "
+          f"(roi_left_frac={cam.roi_left_frac}, roi_right_frac={cam.roi_right_frac}), imgsz={cam.imgsz}")
 
     ret, frame = cam.read_frame()
     if ret:

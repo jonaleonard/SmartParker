@@ -14,7 +14,8 @@ import time
 import cv2
 from flask import Flask, Response, jsonify, render_template_string, request
 
-from calibration_config import load_center_offset_px, load_roi_right_frac, save_calibration
+from calibration_config import (load_center_offset_px, load_roi_left_frac,
+                                load_roi_right_frac, save_calibration)
 from camera import AlignmentCamera
 from distance_sensor import UltrasonicDistance
 from fusion import ParkingFusion
@@ -33,6 +34,7 @@ cam = AlignmentCamera(
     imgsz=DETECTION_IMGSZ,
     center_offset_px=load_center_offset_px(),
     roi_right_frac=load_roi_right_frac(),
+    roi_left_frac=load_roi_left_frac(),
 )
 ultrasonic = UltrasonicDistance()
 fusion = ParkingFusion(stop_distance_cm=STOP_DISTANCE_CM, center_tolerance_px=CENTER_TOLERANCE_PX)
@@ -121,29 +123,39 @@ def calibration():
             "center_offset_px": cam.center_offset_px,
             "frame_width": cam.frame_width,
             "capture_width": cam.capture_width,
+            "roi_left_frac": cam.roi_left_frac,
             "roi_right_frac": cam.roi_right_frac,
         })
 
     data = request.get_json(silent=True) or {}
     try:
         center_offset_px = int(data["center_offset_px"])
+        roi_left_frac = float(data["roi_left_frac"])
         roi_right_frac = float(data["roi_right_frac"])
     except (KeyError, TypeError, ValueError):
-        return jsonify({"error": "center_offset_px must be an integer and roi_right_frac must be a number"}), 400
+        return jsonify({"error": "center_offset_px must be an integer and ROI boundaries must be numbers"}), 400
 
+    if not 0 <= roi_left_frac < 1:
+        return jsonify({"error": "roi_left_frac must be at least 0 and less than 1"}), 400
     if not 0 < roi_right_frac <= 1:
         return jsonify({"error": "roi_right_frac must be greater than 0 and at most 1"}), 400
+    roi_left_px = int(cam.capture_width * roi_left_frac)
+    roi_right_px = int(cam.capture_width * roi_right_frac)
+    if roi_left_px >= roi_right_px:
+        return jsonify({"error": "ROI left boundary must be to the left of the right boundary"}), 400
 
     # Keep the selected center inside the newly selected ROI frame.
-    roi_width = max(1, int(cam.capture_width * roi_right_frac))
+    roi_width = roi_right_px - roi_left_px
     half_width = roi_width / 2
     if not -half_width <= center_offset_px <= half_width:
         return jsonify({"error": "center_offset_px is outside the video frame"}), 400
 
-    center_offset_px, roi_right_frac = save_calibration(center_offset_px, roi_right_frac)
+    center_offset_px, roi_right_frac, roi_left_frac = save_calibration(
+        center_offset_px, roi_right_frac, roi_left_frac)
     cam.center_offset_px = center_offset_px
-    cam.set_roi_right_frac(roi_right_frac)
+    cam.set_roi_bounds(roi_left_frac, roi_right_frac)
     return jsonify({"center_offset_px": center_offset_px,
+                    "roi_left_frac": roi_left_frac,
                     "roi_right_frac": roi_right_frac,
                     "frame_width": cam.frame_width,
                     "capture_width": cam.capture_width})
@@ -261,6 +273,7 @@ CALIBRATION_HTML = """
   .calibration-line::before { content:''; position:absolute; left:-10px; right:-10px; top:0; bottom:0; }
   #center-line { background:#ffcf33; }
   #roi-line { background:#43b9ff; }
+  #roi-left-line { background:#c86bff; }
   .actions { display:flex; align-items:center; gap:12px; margin-top:16px; }
   button { background:#ffcf33; border:0; border-radius:7px; padding:10px 16px; font-size:16px; font-weight:600; color:#111; }
   #message { color:#bbb; }
@@ -269,10 +282,11 @@ CALIBRATION_HTML = """
 </head>
 <body>
   <h1>Calibrate parking spot</h1>
-  <p>Drag the yellow line to the parking-spot center and the blue line to its right edge. The blue line determines the portion of the camera feed used for parking guidance.</p>
+  <p>Drag the yellow line to the parking-spot center, the purple line to its left edge, and the blue line to its right edge. The region between the boundary lines is used for parking guidance.</p>
   <div id="video-wrap">
     <img id="video" src="/calibration_video_feed" alt="Live garage camera feed">
     <div id="center-line" class="calibration-line" title="Drag to set parking-spot center"></div>
+    <div id="roi-left-line" class="calibration-line" title="Drag to set parking-spot left edge"></div>
     <div id="roi-line" class="calibration-line" title="Drag to set parking-spot right edge"></div>
   </div>
   <div class="actions">
@@ -282,17 +296,21 @@ CALIBRATION_HTML = """
 <script>
 let captureWidth = 0;
 let centerOffset = 0;
+let roiLeftFrac = 0;
 let roiRightFrac = 1;
 let draggingLine = null;
 const videoWrap = document.getElementById('video-wrap');
 const centerLine = document.getElementById('center-line');
+const roiLeftLine = document.getElementById('roi-left-line');
 const roiLine = document.getElementById('roi-line');
 const message = document.getElementById('message');
 
 function drawLines() {
   if (!captureWidth) return;
-  const roiWidth = captureWidth * roiRightFrac;
-  centerLine.style.left = ((roiWidth / 2 + centerOffset) / captureWidth * 100) + '%';
+  const roiLeftPx = captureWidth * roiLeftFrac;
+  const roiWidth = captureWidth * roiRightFrac - roiLeftPx;
+  centerLine.style.left = ((roiLeftPx + roiWidth / 2 + centerOffset) / captureWidth * 100) + '%';
+  roiLeftLine.style.left = (roiLeftFrac * 100) + '%';
   roiLine.style.left = (roiRightFrac * 100) + '%';
 }
 
@@ -303,12 +321,19 @@ function pointerFraction(event) {
 
 function setLineFromPointer(event) {
   const fraction = pointerFraction(event);
+  const centerFraction = (captureWidth * roiLeftFrac
+                          + (captureWidth * roiRightFrac - captureWidth * roiLeftFrac) / 2
+                          + centerOffset) / captureWidth;
   if (draggingLine === 'roi') {
-    const centerFraction = (captureWidth * roiRightFrac / 2 + centerOffset) / captureWidth;
-    roiRightFrac = Math.max(1 / captureWidth, centerFraction, fraction);
+    roiRightFrac = Math.max(roiLeftFrac + 1 / captureWidth, centerFraction, fraction);
+  } else if (draggingLine === 'roi-left') {
+    roiLeftFrac = Math.min(roiRightFrac - 1 / captureWidth, centerFraction, fraction);
   } else {
-    centerOffset = Math.round(Math.min(roiRightFrac, fraction) * captureWidth
-                              - (captureWidth * roiRightFrac) / 2);
+    const centerPx = Math.max(captureWidth * roiLeftFrac,
+                              Math.min(captureWidth * roiRightFrac, fraction * captureWidth));
+    centerOffset = Math.round(centerPx
+                              - (captureWidth * roiLeftFrac
+                                 + (captureWidth * roiRightFrac - captureWidth * roiLeftFrac) / 2));
   }
   drawLines();
 }
@@ -316,6 +341,7 @@ function setLineFromPointer(event) {
 fetch('/calibration').then(response => response.json()).then(data => {
   captureWidth = data.capture_width;
   centerOffset = data.center_offset_px;
+  roiLeftFrac = data.roi_left_frac;
   roiRightFrac = data.roi_right_frac;
   drawLines();
 }).catch(() => { message.textContent = 'Unable to load current calibration.'; });
@@ -327,7 +353,7 @@ function startDragging(which, event) {
   setLineFromPointer(event);
 }
 
-for (const [which, line] of [['center', centerLine], ['roi', roiLine]]) {
+for (const [which, line] of [['center', centerLine], ['roi-left', roiLeftLine], ['roi', roiLine]]) {
   line.addEventListener('pointerdown', event => startDragging(which, event));
   line.addEventListener('pointermove', event => { if (draggingLine === which) setLineFromPointer(event); });
   line.addEventListener('pointerup', () => { draggingLine = null; });
@@ -339,11 +365,13 @@ document.getElementById('save').addEventListener('click', async () => {
   try {
     const response = await fetch('/calibration', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({center_offset_px: centerOffset, roi_right_frac: roiRightFrac})
+      body: JSON.stringify({center_offset_px: centerOffset, roi_left_frac: roiLeftFrac,
+                            roi_right_frac: roiRightFrac})
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Save failed');
     centerOffset = data.center_offset_px;
+    roiLeftFrac = data.roi_left_frac;
     roiRightFrac = data.roi_right_frac;
     captureWidth = data.capture_width;
     drawLines();
