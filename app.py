@@ -14,7 +14,7 @@ import time
 import cv2
 from flask import Flask, Response, jsonify, render_template_string, request
 
-from calibration_config import load_center_offset_px, save_calibration
+from calibration_config import load_center_offset_px, load_roi_right_frac, save_calibration
 from camera import AlignmentCamera
 from distance_sensor import UltrasonicDistance
 from fusion import ParkingFusion
@@ -29,7 +29,11 @@ DETECTION_IMGSZ = 288
 
 app = Flask(__name__)
 
-cam = AlignmentCamera(imgsz=DETECTION_IMGSZ, center_offset_px=load_center_offset_px())
+cam = AlignmentCamera(
+    imgsz=DETECTION_IMGSZ,
+    center_offset_px=load_center_offset_px(),
+    roi_right_frac=load_roi_right_frac(),
+)
 ultrasonic = UltrasonicDistance()
 fusion = ParkingFusion(stop_distance_cm=STOP_DISTANCE_CM, center_tolerance_px=CENTER_TOLERANCE_PX)
 
