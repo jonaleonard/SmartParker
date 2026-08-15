@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import onnxruntime as ort
+from collections import deque
 
 from calibration_config import load_roi_right_frac
 
@@ -13,9 +14,12 @@ class AlignmentCamera:
     """
 
     COCO_CAR_CLASS = 2  # "car" class ID in the COCO dataset YOLO is trained on
+    LOCK_ON_WINDOW_FRAMES = 6
+    LOCK_ON_HITS = 2
+    RELEASE_AFTER_MISSES = 8
 
-    def __init__(self, camera_index=0, width=1280, height=720, confidence=0.4,
-                 imgsz=288, center_offset_px=0, roi_right_frac=None):
+    def __init__(self, camera_index=0, width=1280, height=720, confidence=0.2,
+                 imgsz=480, center_offset_px=0, roi_right_frac=1.0):
         """
         imgsz: retained for compatibility with existing callers. The exported
             ONNX model's input shape is used for inference (normally 640x640).
@@ -59,6 +63,32 @@ class AlignmentCamera:
         self.confidence = confidence
         self.imgsz = imgsz
         self.center_offset_px = center_offset_px
+        self._printed_output_debug = False
+        self._detection_history = deque(maxlen=self.LOCK_ON_WINDOW_FRAMES)
+        self._last_valid_detection = None
+        self._locked_on = False
+        self._consecutive_misses = 0
+
+    def _smoothed_detection(self, offset_px, box_height_px, detected):
+        """Apply lock/release hysteresis while retaining the latest geometry."""
+        self._detection_history.append(detected)
+        if detected:
+            self._last_valid_detection = (offset_px, box_height_px)
+            self._consecutive_misses = 0
+            if not self._locked_on:
+                self._locked_on = sum(self._detection_history) >= self.LOCK_ON_HITS
+        elif self._locked_on:
+            self._consecutive_misses += 1
+            if self._consecutive_misses >= self.RELEASE_AFTER_MISSES:
+                self._locked_on = False
+
+        if not self._locked_on:
+            return 0, 0, False
+        if detected:
+            return offset_px, box_height_px, True
+
+        # A lock keeps the car present through intermittent inference misses.
+        return (*self._last_valid_detection, True)
 
     def set_roi_right_frac(self, roi_right_frac):
         """Set the right crop boundary as a fraction of the captured frame."""
@@ -123,19 +153,28 @@ class AlignmentCamera:
         return image, scale, left, top
 
     def _car_boxes_from_output(self, output):
-        """Extract car boxes and scores from raw or NMS-fused YOLOv8 output."""
+        """Extract car boxes, scores, and pre-NMS debug counts from YOLO output."""
         detections = np.squeeze(output)
         if detections.ndim != 2:
-            return np.empty((0, 4), dtype=np.float32), np.empty(0, dtype=np.float32)
+            return (np.empty((0, 4), dtype=np.float32), np.empty(0, dtype=np.float32),
+                    0, 0, float("nan"))
 
         # Standard Ultralytics YOLOv8 export: [1, 84, 8400] -> [8400, 84].
         # Values are xywh followed by the 80 per-class confidences.
         if detections.shape[0] in (84, 85) and detections.shape[1] > detections.shape[0]:
             detections = detections.T
         if detections.shape[1] >= 84:
-            scores = detections[:, 4 + self.COCO_CAR_CLASS]
-            selected = detections[scores >= self.confidence]
-            scores = scores[scores >= self.confidence]
+            # For [cx, cy, w, h, class0, ..., class79], score row 6 is the
+            # COCO car score (4 + class 2).  Do not use an all-class argmax:
+            # that would retain anchors whose strongest class is not a car.
+            car_scores = detections[:, 4 + self.COCO_CAR_CLASS]
+            highest_raw_score = float(np.max(car_scores)) if car_scores.size else float("nan")
+            keep = car_scores >= self.confidence
+            # The car-score threshold is the class filter for a raw YOLOv8
+            # output, so this count must reflect only retained car anchors.
+            class_count = int(np.count_nonzero(keep))
+            selected = detections[keep]
+            scores = car_scores[keep]
             xywh = selected[:, :4]
             boxes = np.column_stack((
                 xywh[:, 0] - xywh[:, 2] / 2,
@@ -143,18 +182,20 @@ class AlignmentCamera:
                 xywh[:, 0] + xywh[:, 2] / 2,
                 xywh[:, 1] + xywh[:, 3] / 2,
             ))
-            return boxes, scores
+            return boxes, scores, class_count, len(boxes), highest_raw_score
 
         # NMS-fused exports commonly use [batch, detections, 6] as
         # (x1, y1, x2, y2, confidence, class_id).
         if detections.shape[1] == 6:
-            car = detections[(detections[:, 5].astype(int) == self.COCO_CAR_CLASS)
-                             & (detections[:, 4] >= self.confidence)]
-            return car[:, :4], car[:, 4]
+            highest_raw_score = float(np.max(detections[:, 4])) if len(detections) else float("nan")
+            car = detections[detections[:, 5].astype(int) == self.COCO_CAR_CLASS]
+            selected = car[car[:, 4] >= self.confidence]
+            return selected[:, :4], selected[:, 4], len(car), len(selected), highest_raw_score
         if detections.shape[0] == 6:
             return self._car_boxes_from_output(detections.T[None, ...])
 
-        return np.empty((0, 4), dtype=np.float32), np.empty(0, dtype=np.float32)
+        return (np.empty((0, 4), dtype=np.float32), np.empty(0, dtype=np.float32),
+                0, 0, float("nan"))
 
     def read_frame(self):
         """Grabs one raw frame from the camera and crops it to the watched ROI. Returns (ret, frame)."""
@@ -171,17 +212,25 @@ class AlignmentCamera:
         - offset_px: negative = car is left of center, positive = right of center
         - box_height_px: height of detected car's bounding box (proxy for closeness,
           NOT a substitute for the ultrasonic sensor's actual distance reading)
-        - detected: True if a car was found this frame
+        - detected: True while the car is locked on, including brief raw misses
         """
         image, scale, pad_x, pad_y = self._preprocess(frame)
         outputs = self.model.run(None, {self.input_name: image})
-        boxes, scores = self._car_boxes_from_output(outputs[0])
+        boxes, scores, class_count, confidence_count, highest_raw_score = self._car_boxes_from_output(outputs[0])
+        if not self._printed_output_debug:
+            print(f"DEBUG raw ONNX output shape: {outputs[0].shape}")
+            self._printed_output_debug = True
+        print(f"DEBUG highest raw confidence: {highest_raw_score:.6f}")
+        print(f"DEBUG boxes after car class filter (class {self.COCO_CAR_CLASS}): {class_count}")
+        print(f"DEBUG boxes after confidence threshold ({self.confidence:.2f}): {confidence_count}")
         if len(boxes) == 0:
-            return 0, 0, False
+            print("DEBUG boxes after NMS: 0")
+            return self._smoothed_detection(0, 0, False)
 
         # Raw YOLOv8 ONNX outputs do not include NMS. Running it here is also
         # harmless for NMS-fused outputs and keeps behavior consistent.
         boxes = boxes[self._nms(boxes, scores)]
+        print(f"DEBUG boxes after NMS: {len(boxes)}")
 
         # Convert letterboxed model coordinates back to the captured ROI.
         boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_x) / scale
@@ -201,7 +250,7 @@ class AlignmentCamera:
         frame_center_x = frame_width / 2
         offset_px = box_center_x - frame_center_x - self.center_offset_px
 
-        return offset_px, box_height_px, True
+        return self._smoothed_detection(offset_px, box_height_px, True)
 
     def get_alignment(self):
         """Convenience wrapper: reads a frame and detects in one call."""
@@ -216,7 +265,7 @@ class AlignmentCamera:
 
 if __name__ == "__main__":
     print("Starting alignment test, Ctrl+C to stop...")
-    cam = AlignmentCamera()
+    cam = AlignmentCamera(roi_right_frac=None, confidence=0.2, imgsz=480)
     print(f"Watching {cam.frame_width}x{cam.frame_height} (roi_right_frac={cam.roi_right_frac}), imgsz={cam.imgsz}")
 
     ret, frame = cam.read_frame()
