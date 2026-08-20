@@ -69,7 +69,7 @@ Calibration values are saved in `config.json`. The dashboard lets you set the vi
 
 ## Screenshots
 
-Add the following source images from the development Mac to `assets/screenshots/` before publishing a documentation update. They are intentionally excluded from this commit because the files are not available on the Raspberry Pi/session that produced this repository.
+The project gallery uses the following images from the development Mac. Copy each source file into the matching repository destination to have it render below and on GitHub.
 
 | Screenshot | Local macOS source path | Repository destination |
 | --- | --- | --- |
@@ -78,14 +78,21 @@ Add the following source images from the development Mac to `assets/screenshots/
 | Hardware view | `/Users/jonleonard/Downloads/SmartParker Hardware View.jpeg` | `assets/screenshots/smartparker-hardware-view.jpeg` |
 | Screen view | `/Users/jonleonard/Downloads/SmartParker Screen View.jpeg` | `assets/screenshots/smartparker-screen-view.jpeg` |
 
-Once copied into those paths, render them in this section with:
+### AI-enhanced full view
 
-```md
 ![AI-enhanced full view](assets/screenshots/smartparker-full-view-ai-enhanced.png)
+
+### Full view
+
 ![Full view](assets/screenshots/smartparker-full-view.jpeg)
+
+### Hardware view
+
 ![Hardware view](assets/screenshots/smartparker-hardware-view.jpeg)
+
+### Screen view
+
 ![Screen view](assets/screenshots/smartparker-screen-view.jpeg)
-```
 
 ## Notes
 
