@@ -84,7 +84,3 @@ Calibration values are saved in `config.json`. The dashboard lets you set the vi
 ### Sensor view
 
 ![Sensor view](assets/screenshots/smartparker-sensor-view.jpeg)
-
-## Notes
-
-This project is designed for parking assistance, not autonomous vehicle control. Always remain responsible for vehicle operation and verify hardware readings during installation and calibration.
