@@ -1,0 +1,7 @@
+flask
+gpiozero
+luma.oled
+numpy
+onnxruntime
+opencv-python
+Pillow

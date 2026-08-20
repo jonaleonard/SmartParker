@@ -41,9 +41,12 @@ def main():
                 frame_width=cam.frame_width,
                 distance_cm=distance_cm,
                 car_detected=car_detected,
+                guidance=guidance,
             )
 
-            print(f"{guidance:12} | dist: {distance_cm:6.1f} cm | offset: {offset_px:7.1f}px | car: {car_detected}")
+            print(f"{guidance:12} | dist: {distance_cm:6.1f} cm | offset: {offset_px:7.1f}px "
+                  f"| car: {car_detected} | cam {cam.capture_fps_measured:.1f}fps "
+                  f"| detect {cam.detection_fps:.2f}fps")
 
             sleep(LOOP_DELAY_S)
 
@@ -51,6 +54,7 @@ def main():
         print("\nStopping...")
     finally:
         cam.release()
+        display.device.clear()
 
 
 if __name__ == "__main__":

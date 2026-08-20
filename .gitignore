@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+venv/
+roi_snapshot.jpg
+.claude/
+assets/screenshots/

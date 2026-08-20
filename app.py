@@ -2,7 +2,7 @@
 Web dashboard for the Smart Garage Parking Assistant.
 Serves a live webcam feed with detection boxes drawn on it, plus a
 real-time alignment/distance gauge — viewable from any browser on the
-same WiFi network (phone, Mac, etc).
+same WiFi network (phone, Mac, etc). Also drives the OLED panel.
 
 Run with: python3 app.py
 Then visit: http://<pi-ip>:5000
@@ -18,15 +18,30 @@ from calibration_config import (load_center_offset_px, load_roi_left_frac,
                                 load_roi_right_frac, save_calibration)
 from camera import AlignmentCamera
 from distance_sensor import UltrasonicDistance
+from display import ParkingDisplay
 from fusion import ParkingFusion
 
 STOP_DISTANCE_CM = 20
 CENTER_TOLERANCE_PX = 40
-LOOP_DELAY_S = 0.02  # small yield only; detection itself (~0.2-0.3s) sets the real pace
 
-# YOLO inference size in px; lower = faster but less accurate on small/far.
-# The saved ROI crop narrows the wide camera image before it is resized.
+# YOLO inference size in px. The exported ONNX model's own fixed input shape
+# is what actually governs inference cost; this is kept for compatibility.
 DETECTION_IMGSZ = 288
+
+# Streaming is deliberately decoupled from detection. Inference costs ~550ms
+# per frame on a Pi 4, so anything that waits on it can only ever show ~2fps
+# of very stale video. The encoder instead publishes the newest camera frame
+# at STREAM_FPS with the most recent detection drawn over it, which is what
+# makes the feed look live.
+STREAM_FPS = 15
+STREAM_WIDTH = 640   # downscaled from the capture width; keeps latency and bandwidth low
+JPEG_QUALITY = 60    # visibly fine for a demo, roughly a third the bytes of the default 95
+CALIBRATION_STREAM_FPS = 6  # only viewed while someone is on the calibration page
+
+DISPLAY_FPS = 5      # OLED refresh; the panel itself cannot usefully go faster
+SENSOR_FPS = 10      # ultrasonic poll rate
+
+JPEG_PARAMS = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
 
 app = Flask(__name__)
 
@@ -39,59 +54,247 @@ cam = AlignmentCamera(
 ultrasonic = UltrasonicDistance()
 fusion = ParkingFusion(stop_distance_cm=STOP_DISTANCE_CM, center_tolerance_px=CENTER_TOLERANCE_PX)
 
-# shared state, updated by the background loop, read by Flask routes
+# The OLED is optional: a missing panel or a missing luma.oled install should
+# degrade to a working web dashboard rather than stopping the whole app.
+try:
+    display = ParkingDisplay(stop_distance_cm=STOP_DISTANCE_CM)
+    display_error = None
+except Exception as error:  # noqa: BLE001 - any I2C/import failure is non-fatal here
+    display = None
+    display_error = str(error)
+    print(f"WARNING: OLED display unavailable ({error}). Web dashboard will still run.")
+
+# shared state, updated by the background loops, read by Flask routes
 state_lock = threading.Lock()
 latest = {
-    "frame": None,
-    "calibration_frame": None,
     "offset_px": 0,
     "frame_width": cam.frame_width,
     "distance_cm": None,
     "car_detected": False,
     "guidance": "STARTING",
+    "box": None,
+    "stream_fps": 0.0,
 }
 
 
-def sensor_loop():
+class FrameBroker:
+    """
+    Holds the most recently encoded JPEG and wakes streaming clients when a
+    new one arrives. Encoding happens once no matter how many browsers are
+    watching, and a client that cannot keep up simply skips ahead to the
+    newest frame instead of accumulating a backlog.
+    """
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._jpeg = None
+        self._sequence = 0
+        self._viewers = 0
+
+    @property
+    def viewers(self):
+        with self._condition:
+            return self._viewers
+
+    def publish(self, jpeg):
+        with self._condition:
+            self._jpeg = jpeg
+            self._sequence += 1
+            self._condition.notify_all()
+
+    def wait_for_viewer(self, timeout=0.5):
+        """Block while nobody is watching so idle streams cost no CPU."""
+        with self._condition:
+            return self._condition.wait_for(lambda: self._viewers > 0, timeout=timeout)
+
+    def stream(self):
+        with self._condition:
+            self._viewers += 1
+            self._condition.notify_all()
+            last_sequence = self._sequence
+        try:
+            while True:
+                with self._condition:
+                    got_frame = self._condition.wait_for(
+                        lambda: self._sequence != last_sequence, timeout=5.0)
+                    if not got_frame:
+                        continue
+                    last_sequence = self._sequence
+                    jpeg = self._jpeg
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n")
+        finally:
+            with self._condition:
+                self._viewers -= 1
+
+
+dashboard_broker = FrameBroker()
+calibration_broker = FrameBroker()
+
+
+def detection_loop():
+    """Runs YOLO as fast as it can manage, independent of the video stream."""
     while True:
-        ret, raw_frame = cam.read_frame()
-        offset_px, box_height_px, car_detected = cam.detect(raw_frame) if ret else (0, 0, False)
-        distance_cm = ultrasonic.get_distance_cm()
+        ret, roi_frame = cam.read_frame()
+        if not ret:
+            time.sleep(0.05)
+            continue
+
+        offset_px, box_height_px, car_detected = cam.detect(roi_frame)
+        with state_lock:
+            distance_cm = latest["distance_cm"]
         guidance = fusion.get_guidance(offset_px, car_detected, distance_cm)
 
-        annotated = raw_frame if ret else None
-        if ret and car_detected:
-            # offset_px is relative to the calibrated garage center, not the
-            # camera's raw geometric center, so the reference line has to
-            # shift by the same calibration offset to match.
-            garage_center_x = int(cam.frame_width / 2 + cam.center_offset_px)
-            cx = int(garage_center_x + offset_px)
-            cv2.line(annotated, (garage_center_x, 0), (garage_center_x, 40), (0, 255, 0), 2)
-            cv2.circle(annotated, (cx, 20), 8, (0, 0, 255), -1)
-            cv2.putText(annotated, guidance, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-
         with state_lock:
-            latest["frame"] = annotated
-            latest["calibration_frame"] = cam.last_full_frame
             latest["offset_px"] = offset_px
             latest["frame_width"] = cam.frame_width
-            latest["distance_cm"] = distance_cm
             latest["car_detected"] = car_detected
             latest["guidance"] = guidance
+            latest["box"] = cam.last_box if car_detected else None
 
-        time.sleep(LOOP_DELAY_S)
+
+def sensor_loop():
+    """Polls the ultrasonic sensor on its own schedule; it is far cheaper than vision."""
+    interval = 1.0 / SENSOR_FPS
+    while True:
+        try:
+            distance_cm = ultrasonic.get_distance_cm()
+        except Exception:  # noqa: BLE001 - a bad reading should not kill the loop
+            distance_cm = None
+        with state_lock:
+            latest["distance_cm"] = distance_cm
+        time.sleep(interval)
 
 
-def generate_mjpeg(frame_key="frame"):
+def display_loop():
+    """Drives the OLED from the same shared state the web dashboard reads."""
+    if display is None:
+        return
+    interval = 1.0 / DISPLAY_FPS
     while True:
         with state_lock:
-            frame = latest[frame_key]
-        if frame is not None:
-            ok, jpeg = cv2.imencode(".jpg", frame)
-            if ok:
-                yield (b"--frame\r\n"
-                       b"Content-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n")
-        time.sleep(LOOP_DELAY_S)
+            offset_px = latest["offset_px"]
+            frame_width = latest["frame_width"]
+            distance_cm = latest["distance_cm"]
+            car_detected = latest["car_detected"]
+            guidance = latest["guidance"]
+        try:
+            display.show(offset_px=offset_px, frame_width=frame_width,
+                         distance_cm=distance_cm, car_detected=car_detected,
+                         guidance=guidance)
+        except Exception as error:  # noqa: BLE001 - keep the app alive if I2C glitches
+            print(f"WARNING: OLED update failed: {error}")
+        time.sleep(interval)
+
+
+def annotate(frame, scale):
+    """Draw guidance overlays onto an already-downscaled ROI frame."""
+    with state_lock:
+        offset_px = latest["offset_px"]
+        car_detected = latest["car_detected"]
+        guidance = latest["guidance"]
+        distance_cm = latest["distance_cm"]
+        box = latest["box"]
+
+    height, width = frame.shape[:2]
+
+    # offset_px is relative to the calibrated garage center, not the camera's
+    # raw geometric center, so the reference line has to shift by the same
+    # calibration offset to match.
+    garage_center_x = int((cam.frame_width / 2 + cam.center_offset_px) * scale)
+
+    if car_detected:
+        if box is not None:
+            x1, y1, x2, y2 = (int(value * scale) for value in box)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 2)
+        # The car marker is drawn as a middle band only, and the target line
+        # over the top of it, so a perfectly centered car still shows both.
+        marker_x = int(garage_center_x + offset_px * scale)
+        cv2.line(frame, (marker_x, int(height * 0.35)), (marker_x, int(height * 0.65)),
+                 (0, 0, 255), 3)
+
+    cv2.line(frame, (garage_center_x, 0), (garage_center_x, height), (0, 255, 0), 2)
+
+    color = (0, 0, 255) if guidance == "STOP" else (0, 255, 0) if guidance == "CENTER" else (0, 215, 255)
+    cv2.putText(frame, guidance, (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+
+    distance_text = f"{distance_cm:.0f} cm" if distance_cm is not None else "-- cm"
+    cv2.putText(frame, distance_text, (12, height - 14), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (255, 255, 255), 2)
+
+    stats = f"cam {cam.capture_fps_measured:.0f}fps  det {cam.detection_fps:.1f}fps"
+    cv2.putText(frame, stats, (width - 250, height - 14), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (200, 200, 200), 1)
+    return frame
+
+
+def encode_loop():
+    """
+    Publishes the newest camera frame at STREAM_FPS with the latest detection
+    drawn on it. Never waits on inference, so the video stays live.
+    """
+    interval = 1.0 / STREAM_FPS
+    last_sequence = None
+    next_deadline = time.monotonic()
+    fps_marker = time.monotonic()
+    frames = 0
+
+    while True:
+        if not dashboard_broker.wait_for_viewer():
+            continue
+
+        frame, last_sequence = cam.latest_full_frame(since_seq=last_sequence, timeout=1.0)
+        if frame is None:
+            continue
+
+        roi = cam.crop_to_roi(frame)
+        scale = STREAM_WIDTH / roi.shape[1]
+        if scale < 1:
+            small = cv2.resize(roi, (STREAM_WIDTH, int(roi.shape[0] * scale)),
+                               interpolation=cv2.INTER_AREA)
+        else:
+            small, scale = roi.copy(), 1.0
+
+        ok, jpeg = cv2.imencode(".jpg", annotate(small, scale), JPEG_PARAMS)
+        if ok:
+            dashboard_broker.publish(jpeg.tobytes())
+            frames += 1
+
+        now = time.monotonic()
+        if now - fps_marker >= 1.0:
+            with state_lock:
+                latest["stream_fps"] = frames / (now - fps_marker)
+            frames = 0
+            fps_marker = now
+
+        # Pace to STREAM_FPS without drifting, and without sleeping away time
+        # already spent encoding.
+        next_deadline = max(next_deadline + interval, now - interval)
+        sleep_for = next_deadline - now
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+
+def calibration_encode_loop():
+    """Streams the uncropped frame, only while the calibration page is open."""
+    interval = 1.0 / CALIBRATION_STREAM_FPS
+    last_sequence = None
+    while True:
+        if not calibration_broker.wait_for_viewer():
+            continue
+
+        frame, last_sequence = cam.latest_full_frame(since_seq=last_sequence, timeout=1.0)
+        if frame is None:
+            continue
+
+        scale = STREAM_WIDTH / frame.shape[1]
+        if scale < 1:
+            frame = cv2.resize(frame, (STREAM_WIDTH, int(frame.shape[0] * scale)),
+                               interpolation=cv2.INTER_AREA)
+        ok, jpeg = cv2.imencode(".jpg", frame, JPEG_PARAMS)
+        if ok:
+            calibration_broker.publish(jpeg.tobytes())
+        time.sleep(interval)
 
 
 @app.route("/")
@@ -101,13 +304,14 @@ def index():
 
 @app.route("/video_feed")
 def video_feed():
-    return Response(generate_mjpeg(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    return Response(dashboard_broker.stream(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.route("/calibration_video_feed")
 def calibration_video_feed():
     """Full camera image so the ROI boundary can be positioned visually."""
-    return Response(generate_mjpeg("calibration_frame"),
+    return Response(calibration_broker.stream(),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
@@ -170,6 +374,11 @@ def status():
             "distance_cm": latest["distance_cm"],
             "car_detected": latest["car_detected"],
             "guidance": latest["guidance"],
+            "stream_fps": round(latest["stream_fps"], 1),
+            "capture_fps": round(cam.capture_fps_measured, 1),
+            "detection_fps": round(cam.detection_fps, 2),
+            "display_ok": display is not None,
+            "display_error": display_error,
         })
 
 
@@ -193,6 +402,8 @@ DASHBOARD_HTML = """
   #guidance.move { color:#ffd24d; }
   .gauge-wrap { background:#1c1c1c; border-radius:10px; padding:16px; }
   svg { display:block; margin:0 auto; }
+  #perf { color:#777; font-size:12px; margin-top:12px; text-align:center; }
+  #perf .warn { color:#ff8a4d; }
 </style>
 </head>
 <body>
@@ -222,6 +433,8 @@ DASHBOARD_HTML = """
     </svg>
   </div>
 
+  <div id="perf"></div>
+
 <script>
 async function poll() {
   try {
@@ -245,6 +458,11 @@ async function poll() {
     } else {
       dot.setAttribute('fill', '#555');
     }
+
+    document.getElementById('perf').innerHTML =
+      'video ' + d.stream_fps + ' fps &middot; camera ' + d.capture_fps + ' fps &middot; detection '
+      + d.detection_fps + ' fps'
+      + (d.display_ok ? '' : ' &middot; <span class="warn">OLED offline</span>');
   } catch (e) {
     console.error(e);
   }
@@ -386,6 +604,6 @@ document.getElementById('save').addEventListener('click', async () => {
 """
 
 if __name__ == "__main__":
-    t = threading.Thread(target=sensor_loop, daemon=True)
-    t.start()
+    for loop in (sensor_loop, detection_loop, encode_loop, calibration_encode_loop, display_loop):
+        threading.Thread(target=loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5000, threaded=True)
