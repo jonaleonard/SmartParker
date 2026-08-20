@@ -69,22 +69,9 @@ Calibration values are saved in `config.json`. The dashboard lets you set the vi
 
 ## Screenshots
 
-The project gallery uses the following images from the development Mac. Copy each source file into the matching repository destination to have it render below and on GitHub.
-
-| Screenshot | Local macOS source path | Repository destination |
-| --- | --- | --- |
-| AI-enhanced full view | `/Users/jonleonard/Downloads/SmartParker Full View - AI Enhanced.png` | `assets/screenshots/smartparker-full-view-ai-enhanced.png` |
-| Full view | `/Users/jonleonard/Downloads/SmartParker Full View.jpeg` | `assets/screenshots/smartparker-full-view.jpeg` |
-| Hardware view | `/Users/jonleonard/Downloads/SmartParker Hardware View.jpeg` | `assets/screenshots/smartparker-hardware-view.jpeg` |
-| Screen view | `/Users/jonleonard/Downloads/SmartParker Screen View.jpeg` | `assets/screenshots/smartparker-screen-view.jpeg` |
-
 ### AI-enhanced full view
 
 ![AI-enhanced full view](assets/screenshots/smartparker-full-view-ai-enhanced.png)
-
-### Full view
-
-![Full view](assets/screenshots/smartparker-full-view.jpeg)
 
 ### Hardware view
 
@@ -93,6 +80,10 @@ The project gallery uses the following images from the development Mac. Copy eac
 ### Screen view
 
 ![Screen view](assets/screenshots/smartparker-screen-view.jpeg)
+
+### Sensor view
+
+![Sensor view](assets/screenshots/smartparker-sensor-view.jpeg)
 
 ## Notes
 
